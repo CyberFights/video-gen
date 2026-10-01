@@ -219,6 +219,14 @@ app.listen(port, "0.0.0.0", async () => {
     console.log(`Renderer configured at ${renderer.url} (from PYTHON_API_${renderer.source.toUpperCase()}).`);
   }
 
+  if (renderer.selfReference) {
+    console.warn(
+      `PYTHON_API_* points at ${renderer.hostname}, which is this service's own private domain, ` +
+      "so renders will fail with ECONNREFUSED. Point it at the renderer service: " +
+      "PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000."
+    );
+  }
+
   const status = await checkRenderer();
   if (status.reachable) console.log(`Renderer health check passed at ${status.url}.`);
   else console.warn(`Renderer health check failed: ${status.error}`);
