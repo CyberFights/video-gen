@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import dns from "node:dns/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -44,6 +45,20 @@ function ownHostnames() {
 }
 
 /**
+ * Railway private hostnames are exactly `<service-name>.railway.internal`.
+ * A configured host like `renderer.video-gen.railway.internal` carries extra
+ * labels — usually a project name typed into the hostname — and can never
+ * resolve. The name the caller almost certainly meant is the first label plus
+ * `.railway.internal`: `renderer.railway.internal` in that example.
+ */
+function likelyPrivateHostname(hostname) {
+  if (!hostname?.endsWith(".railway.internal")) return null;
+  const labels = hostname.slice(0, -".railway.internal".length).split(".");
+  if (labels.length < 2 || labels.some(label => !label)) return null;
+  return `${labels[0]}.railway.internal`;
+}
+
+/**
  * Resolves the renderer base URL from the environment.
  *
  * `source` is "url" or "host" when the renderer was configured explicitly and
@@ -79,7 +94,11 @@ export function rendererConfig() {
     selfReference,
     // Pointing at our own private domain *and* our own port is doubly wrong.
     selfLoop: selfReference && port === appPort,
-    privateNetwork: Boolean(hostname?.endsWith(".railway.internal"))
+    privateNetwork: Boolean(hostname?.endsWith(".railway.internal")),
+    // Set when the private hostname has extra labels (e.g. a project segment)
+    // and therefore cannot resolve; holds the `<service>.railway.internal`
+    // name the caller most likely meant.
+    expectedPrivateHostname: likelyPrivateHostname(hostname)
   };
 }
 
@@ -141,16 +160,66 @@ function rendererDiagnosis(code, config) {
   }
 
   if ((code === "ENOTFOUND" || code === "EAI_AGAIN") && config.privateNetwork) {
-    hints.push(
-      `${config.hostname} did not resolve. Private DNS only resolves for services in the same project and ` +
-      "environment, and only at runtime, so confirm the renderer is deployed there and the variable reference resolved."
-    );
+    if (config.expectedPrivateHostname) {
+      hints.push(
+        `${config.hostname} is not a name Railway private DNS will ever answer: private hostnames are ` +
+        "exactly `<service-name>.railway.internal` — the project name is not part of the hostname — " +
+        `so the renderer's private domain is ${config.expectedPrivateHostname}, not ${config.hostname}. ` +
+        "Set PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}} (or hard-code " +
+        `${config.expectedPrivateHostname}) and redeploy.`
+      );
+    } else {
+      hints.push(
+        `${config.hostname} did not resolve. Private DNS only resolves for services in the same project and ` +
+        "environment, and only at runtime, so confirm the renderer is deployed there and the variable reference resolved."
+      );
+    }
   }
 
   return hints;
 }
 
-function rendererUnreachableError(url, cause) {
+/**
+ * When a private hostname fails to resolve and looks like a
+ * `<service>.<project>.railway.internal` mistake, checks whether the correct
+ * `<service>.railway.internal` form resolves — and, if so, whether it answers
+ * `/health` as this app's renderer. Returns a confirmation hint, or null when
+ * there is nothing to correct.
+ */
+async function privateHostnameCorrection(config) {
+  if (!config.expectedPrivateHostname) return null;
+
+  try {
+    await dns.lookup(config.expectedPrivateHostname, { all: true });
+  } catch {
+    // The corrected name does not resolve either; stay with the generic hints.
+    return null;
+  }
+
+  let confirmation = "";
+  try {
+    const response = await fetch(`http://${config.expectedPrivateHostname}:${config.port}/health`, {
+      signal: AbortSignal.timeout(RENDERER_HEALTH_TIMEOUT_MS)
+    });
+    if (response.ok) {
+      const body = await response.json().catch(() => null);
+      confirmation = body?.service === "renderer"
+        ? " and answered /health as the Video Gen renderer"
+        : " and answered /health";
+    }
+  } catch {
+    // The name resolving is already strong evidence; /health is best-effort.
+  }
+
+  return (
+    `Confirmed: ${config.expectedPrivateHostname} resolves${confirmation}. That is the renderer's real ` +
+    "private domain. Railway private hostnames are `<service-name>.railway.internal` and never include the " +
+    "project name, so set PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}} (or hard-code " +
+    `${config.expectedPrivateHostname}) and redeploy.`
+  );
+}
+
+function rendererUnreachableError(url, cause, correction = null) {
   const config = rendererConfig();
   const { configured } = config;
   const code = connectErrorCode(cause) || "unknown error";
@@ -158,6 +227,7 @@ function rendererUnreachableError(url, cause) {
     ? `The renderer at ${url} is unreachable (${code}). Confirm the renderer service is running and that PYTHON_API_URL or PYTHON_API_HOST/PYTHON_API_PORT point at it.`
     : `No renderer is configured, so the app tried ${url} and failed (${code}). Set PYTHON_API_URL, or set PYTHON_API_HOST and PYTHON_API_PORT, to the renderer service (on Railway: PYTHON_API_HOST=\${{renderer.RAILWAY_PRIVATE_DOMAIN}} and PYTHON_API_PORT=8000).`;
   const hints = rendererDiagnosis(code, config);
+  if (correction) hints.push(correction);
   const message = hints.length ? `${base} ${hints.join(" ")}` : base;
 
   const error = new Error(message, { cause });
@@ -190,23 +260,31 @@ async function rendererFetch(url, options, { timeoutMs = RENDERER_REQUEST_TIMEOU
     }
   }
 
-  throw rendererUnreachableError(pythonApiUrl(), lastError);
+  // A private hostname with extra labels never resolves; check whether the
+  // corrected `<service>.railway.internal` form does, so the error can say so.
+  const finalCode = connectErrorCode(lastError);
+  let correction = null;
+  if (finalCode === "ENOTFOUND" || finalCode === "EAI_AGAIN") {
+    correction = await privateHostnameCorrection(rendererConfig()).catch(() => null);
+  }
+  throw rendererUnreachableError(pythonApiUrl(), lastError, correction);
 }
 
 /** Cheap preflight so misconfiguration surfaces before any ffmpeg work. */
 export async function checkRenderer() {
-  const { url, source, configured } = rendererConfig();
+  const config = rendererConfig();
+  const { url, source, configured } = config;
   try {
     const response = await rendererFetch(`${url}/health`, { method: "GET" }, {
       timeoutMs: RENDERER_HEALTH_TIMEOUT_MS,
       attempts: 1
     });
     if (!response.ok) {
-      return { url, source, configured, reachable: false, error: `Renderer health check returned ${response.status}.` };
+      return { url, source, configured, expectedPrivateHostname: config.expectedPrivateHostname, reachable: false, error: `Renderer health check returned ${response.status}.` };
     }
-    return { url, source, configured, reachable: true };
+    return { url, source, configured, expectedPrivateHostname: config.expectedPrivateHostname, reachable: true };
   } catch (error) {
-    return { url, source, configured, reachable: false, error: error.message };
+    return { url, source, configured, expectedPrivateHostname: config.expectedPrivateHostname, reachable: false, error: error.message };
   }
 }
 

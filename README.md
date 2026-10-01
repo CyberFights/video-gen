@@ -202,6 +202,44 @@ that value was copied somewhere the name does not exist:
   the renderer container is not running or the app was started outside the Compose network. Run
   `docker compose up --build` and check `docker compose ps` / `docker compose logs renderer`.
 
+### `ENOTFOUND` with a `<service>.<project>.railway.internal` host
+
+```text
+Renderer configured at http://renderer.video-gen.railway.internal:8000 (from PYTHON_API_HOST).
+Renderer health check failed: The renderer at http://renderer.video-gen.railway.internal:8000 is unreachable (ENOTFOUND).
+```
+
+Railway private hostnames are exactly `<service-name>.railway.internal` — **the project name is not part
+of the hostname**. `renderer.video-gen.railway.internal` slides the project name (`video-gen`) between
+the service name and `railway.internal`, so no such DNS record exists anywhere on Railway: the lookup
+fails with `ENOTFOUND` even when the renderer is deployed and healthy. The renderer's private domain is
+`renderer.railway.internal`.
+
+This happens when `PYTHON_API_HOST` is typed by hand from a guessed hostname format. Never hard-code a
+private hostname; use a reference so Railway fills in the real value:
+
+```bash
+PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}   # resolves to renderer.railway.internal
+PYTHON_API_PORT=8000
+```
+
+Applying [`.railway/railway.ts`](.railway/railway.ts) sets exactly that reference. The app also detects
+the extra-label form on its own: the startup log, `/health/renderer`, generation errors, and `doctor`
+call out the invalid hostname, and when the corrected `<service>.railway.internal` name resolves and
+answers `/health`, they confirm it as the renderer's real private domain.
+
+Two related signals:
+
+- **`Video Gen is listening on 0.0.0.0:8080`.** Railway injects `PORT=8080` at runtime when a service
+  declares no `PORT` of its own. The app works on any port, but an 8080 here means the app service has
+  no declared `PORT` — which in turn means the checked-in IaC definition (which declares `PORT=3000`
+  and the `PYTHON_API_HOST` reference) has not been applied to that environment. Fixing the one
+  renderer variable by hand works, but applying the IaC fixes all of it and keeps it reproducible.
+- **If the renderer service is genuinely *named* `renderer.video-gen`**, then the hostname is valid
+  after all, and `ENOTFOUND` means that service is not running in this environment — check its deploy
+  logs and health check. `npm --prefix node-service run doctor` prints this service's own name plus
+  the DNS/TCP/`/health` evidence needed to tell the two cases apart.
+
 ## Checks
 
 ```bash

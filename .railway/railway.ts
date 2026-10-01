@@ -33,6 +33,10 @@ export default defineRailway(() => {
       DATA_DIR: "/data",
       NODE_ENV: "production",
       PORT: "3000",
+      // Resolves to <service-name>.railway.internal (e.g. renderer.railway.internal).
+      // Railway private hostnames never include the project name, so never
+      // hard-code names like renderer.video-gen.railway.internal — they do not
+      // resolve. The reference also tracks service renames.
       PYTHON_API_HOST: renderer.env.RAILWAY_PRIVATE_DOMAIN,
       PYTHON_API_PORT: "8000",
     },
