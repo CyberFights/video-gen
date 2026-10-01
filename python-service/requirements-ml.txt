@@ -1,0 +1,7 @@
+# Optional CUDA backend. Railway does not currently provide GPU runtimes.
+-r requirements.txt
+accelerate>=1.12,<2
+# Install the CUDA-compatible torch wheel for the target host before this file.
+diffusers>=0.36,<1
+safetensors>=0.7,<1
+transformers>=5.0,<6

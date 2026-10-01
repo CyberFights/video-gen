@@ -1,8 +1,18 @@
 import { useEffect, useState } from "react";
 
-const API_BASE = import.meta.env.VITE_NODE_API_URL || "http://localhost:3001";
+const API_BASE = (import.meta.env.VITE_NODE_API_URL || "").replace(/\/$/, "");
+const apiUrl = path => `${API_BASE}${path}`;
 
-function CharacterCreator({ onCreated }) {
+const inputStyle = {
+  boxSizing: "border-box",
+  width: "100%",
+  border: "1px solid #cbd5e1",
+  borderRadius: 8,
+  padding: 10,
+  font: "inherit"
+};
+
+function CharacterCreator({ onCreated, onError }) {
   const [name, setName] = useState("");
   const [tag, setTag] = useState("");
   const [image, setImage] = useState(null);
@@ -10,37 +20,51 @@ function CharacterCreator({ onCreated }) {
 
   async function createCharacter() {
     setLoading(true);
-    const form = new FormData();
-    form.append("name", name);
-    form.append("tag", tag);
-    if (image) form.append("image", image);
-    const res = await fetch(`${API_BASE}/api/character/upload`, { method: "POST", body: form });
-    const data = await res.json();
-    onCreated(data);
-    setLoading(false);
+    onError("");
+    try {
+      const form = new FormData();
+      form.append("name", name);
+      form.append("tag", tag);
+      if (image) form.append("image", image);
+      const response = await fetch(apiUrl("/api/character/upload"), { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not create the character.");
+      onCreated(data);
+      setName("");
+      setTag("");
+      setImage(null);
+    } catch (error) {
+      onError(error.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
-    <div style={{ marginTop: 32 }}>
-      <h2>Create Character</h2>
+    <section style={{ marginTop: 36, borderTop: "1px solid #e2e8f0", paddingTop: 24 }}>
+      <h2>Create a character</h2>
       <input
-        placeholder="Character Name"
+        placeholder="Character name"
         value={name}
-        onChange={e => setName(e.target.value)}
-        style={{ width: "100%", marginBottom: 8 }}
+        onChange={event => setName(event.target.value)}
+        maxLength={80}
+        style={{ ...inputStyle, marginBottom: 10 }}
       />
       <textarea
         placeholder="Describe the character"
         value={tag}
-        onChange={e => setTag(e.target.value)}
+        onChange={event => setTag(event.target.value)}
+        maxLength={1000}
         rows={3}
-        style={{ width: "100%", marginBottom: 8 }}
+        style={{ ...inputStyle, marginBottom: 10, resize: "vertical" }}
       />
-      <input type="file" accept="image/*" onChange={e => setImage(e.target.files[0])} />
-      <button onClick={createCharacter} disabled={loading}>
-        {loading ? "Creating..." : "Create Character"}
-      </button>
-    </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <input type="file" accept="image/png,image/jpeg,image/webp" onChange={event => setImage(event.target.files[0] || null)} />
+        <button onClick={createCharacter} disabled={loading || !name.trim() || !tag.trim()}>
+          {loading ? "Creating…" : "Create character"}
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -52,113 +76,124 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [videoUrl, setVideoUrl] = useState("");
   const [spec, setSpec] = useState(null);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     async function loadCharacters() {
-      const res = await fetch(`${API_BASE}/characters.json`);
-      const data = await res.json();
-      const list = Object.entries(data).map(([id, c]) => ({ id, ...c }));
-      setCharacters(list);
-      if (!character && list.length) setCharacter(list[0].id);
+      try {
+        const response = await fetch(apiUrl("/api/characters"));
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not load characters.");
+        const list = Object.entries(data).map(([id, value]) => ({ id, ...value }));
+        setCharacters(list);
+        setCharacter(current => current || list[0]?.id || "");
+      } catch (loadError) {
+        setError(loadError.message);
+      }
     }
     loadCharacters();
   }, []);
 
   async function generateFromStory() {
     setLoading(true);
+    setError("");
     setVideoUrl("");
-    const form = new FormData();
-    form.append("story", story);
-    form.append("character", character);
-    if (audio) form.append("audio", audio);
-    const res = await fetch(`${API_BASE}/api/story`, { method: "POST", body: form });
-    const data = await res.json();
-    setVideoUrl(`${API_BASE}${data.file.replace(".", "")}`);
-    setSpec(data.spec);
-    setLoading(false);
+    setSpec(null);
+    try {
+      const form = new FormData();
+      form.append("story", story);
+      form.append("character", character);
+      if (audio) form.append("audio", audio);
+      const response = await fetch(apiUrl("/api/story"), { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Video generation failed.");
+      setVideoUrl(apiUrl(data.file));
+      setSpec(data.spec);
+    } catch (generationError) {
+      setError(generationError.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
-  const currentChar = characters.find(c => c.id === character);
+  const currentCharacter = characters.find(item => item.id === character);
 
   return (
-    <div style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui" }}>
-      <h1>Story → Lipsynced Video</h1>
+    <main style={{ maxWidth: 900, margin: "0 auto", padding: "32px 24px 64px", fontFamily: "Inter, system-ui, sans-serif", color: "#0f172a" }}>
+      <header>
+        <p style={{ margin: 0, color: "#6366f1", fontWeight: 700, letterSpacing: ".08em", textTransform: "uppercase" }}>Video Gen</p>
+        <h1 style={{ margin: "6px 0" }}>Turn a story into a video</h1>
+        <p style={{ color: "#475569", marginTop: 0 }}>Each sentence becomes an animated scene. Add narration to synchronize the finished timeline.</p>
+      </header>
 
-      <textarea
-        value={story}
-        onChange={e => setStory(e.target.value)}
-        rows={6}
-        style={{ width: "100%", marginTop: 8 }}
-        placeholder="Type a short story..."
-      />
+      {error && (
+        <div role="alert" style={{ margin: "20px 0", padding: 12, borderRadius: 8, background: "#fee2e2", color: "#991b1b" }}>
+          {error}
+        </div>
+      )}
 
-      <div style={{ marginTop: 16 }}>
-        <label>
+      <label style={{ display: "block", fontWeight: 650, marginTop: 24 }}>
+        Story
+        <textarea
+          value={story}
+          onChange={event => setStory(event.target.value)}
+          rows={7}
+          maxLength={12000}
+          style={{ ...inputStyle, marginTop: 8, resize: "vertical" }}
+          placeholder="Type a short story. Separate scenes with sentences or line breaks…"
+        />
+      </label>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 20, marginTop: 18 }}>
+        <label style={{ fontWeight: 650 }}>
           Character
-          <select value={character} onChange={e => setCharacter(e.target.value)} style={{ marginLeft: 8 }}>
-            {characters.map(c => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
+          <select value={character} onChange={event => setCharacter(event.target.value)} style={{ ...inputStyle, marginTop: 8 }}>
+            {characters.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
         </label>
-        {currentChar?.image && (
-          <img
-            src={`${API_BASE}${currentChar.image}`}
-            alt="Character"
-            style={{ width: 120, marginTop: 12, borderRadius: 8 }}
-          />
-        )}
+        <label style={{ fontWeight: 650 }}>
+          Narration (optional)
+          <input type="file" accept="audio/*" onChange={event => setAudio(event.target.files[0] || null)} style={{ display: "block", marginTop: 12, maxWidth: "100%" }} />
+        </label>
       </div>
 
-      <input
-        type="file"
-        accept="audio/*"
-        onChange={e => setAudio(e.target.files[0])}
-        style={{ marginTop: 8 }}
-      />
+      {currentCharacter?.image && (
+        <img src={apiUrl(currentCharacter.image)} alt={currentCharacter.name} style={{ width: 120, height: 80, objectFit: "cover", marginTop: 16, borderRadius: 8 }} />
+      )}
 
       <button
         onClick={generateFromStory}
         disabled={loading || !story.trim() || !character}
-        style={{ marginTop: 16 }}
+        style={{ marginTop: 22, padding: "11px 18px", border: 0, borderRadius: 8, background: "#4f46e5", color: "white", font: "inherit", fontWeight: 700, cursor: "pointer" }}
       >
-        {loading ? "Generating..." : "Generate Video"}
+        {loading ? "Generating scenes…" : "Generate video"}
       </button>
 
       {videoUrl && (
-        <div style={{ marginTop: 24 }}>
+        <section style={{ marginTop: 30 }}>
           <h2>Result</h2>
-          <video src={videoUrl} controls style={{ width: "100%", maxHeight: 480, background: "#000" }} />
-        </div>
+          <video src={videoUrl} controls style={{ width: "100%", maxHeight: 500, background: "#000", borderRadius: 10 }} />
+          <p><a href={videoUrl} download>Download video</a></p>
+        </section>
       )}
 
       {spec && (
-        <div style={{ marginTop: 24 }}>
-          <h3>SceneSpec</h3>
-          <pre
-            style={{
-              background: "#111",
-              color: "#eee",
-              padding: 12,
-              borderRadius: 4,
-              fontSize: 12,
-              overflowX: "auto"
-            }}
-          >
+        <details style={{ marginTop: 24 }}>
+          <summary style={{ cursor: "pointer", fontWeight: 650 }}>Scene specification</summary>
+          <pre style={{ background: "#111827", color: "#e5e7eb", padding: 14, borderRadius: 8, fontSize: 12, overflowX: "auto" }}>
             {JSON.stringify(spec, null, 2)}
           </pre>
-        </div>
+        </details>
       )}
 
       <CharacterCreator
-        onCreated={char => {
-          setCharacters(prev => [...prev, { id: char.id, ...char }]);
-          if (!character) setCharacter(char.id);
+        onError={setError}
+        onCreated={created => {
+          setCharacters(previous => [...previous, created]);
+          setCharacter(created.id);
         }}
       />
-    </div>
+    </main>
   );
 }
 

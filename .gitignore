@@ -1,0 +1,13 @@
+**/.DS_Store
+**/.env
+**/.env.*
+!**/.env.example
+**/__pycache__/
+**/*.py[cod]
+**/.venv/
+**/node_modules/
+**/dist/
+node-service/data/
+node-service/generated/
+node-service/uploads/
+python-service/videos/

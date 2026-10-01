@@ -1,0 +1,27 @@
+services:
+  renderer:
+    build:
+      context: ./python-service
+    environment:
+      PORT: 8000
+      VIDEO_BACKEND: cpu
+    ports:
+      - "8000:8000"
+
+  app:
+    build:
+      context: .
+    depends_on:
+      renderer:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      DATA_DIR: /data
+      PYTHON_API_URL: http://renderer:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - app-data:/data
+
+volumes:
+  app-data:
