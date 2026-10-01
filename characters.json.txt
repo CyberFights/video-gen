@@ -1,0 +1,14 @@
+{
+  "ai_girl": {
+    "name": "AI Girl",
+    "tag": "young woman, glowing blue eyes, holographic accessories, futuristic outfit",
+    "seed": 98765,
+    "image": ""
+  },
+  "neo": {
+    "name": "Neo",
+    "tag": "male protagonist, black trench coat, short dark hair, serious expression",
+    "seed": 12345,
+    "image": ""
+  }
+}
