@@ -1,39 +1,262 @@
-import fetch from "node-fetch"; import fs from "fs"; import { spawn } from "child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const PYTHON_API = process.env.PYTHON_API_URL || "http://localhost:8000";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
+const uploadsDir = path.join(dataDir, "uploads");
+const generatedDir = path.join(dataDir, "generated");
+const charactersFile = path.join(dataDir, "characters.json");
+const defaultCharactersFile = path.join(__dirname, "characters.json");
 
-export async function loadCharacters() { const raw = fs.readFileSync("./characters.json"); return JSON.parse(raw.toString()); }
+for (const directory of [dataDir, uploadsDir, generatedDir]) {
+  fs.mkdirSync(directory, { recursive: true });
+}
 
-function framesFromScene(scene) { return scene.duration * scene.fps; }
+function pythonApiUrl() {
+  const configuredUrl = process.env.PYTHON_API_URL?.trim();
+  if (configuredUrl) return configuredUrl.replace(/\/$/, "");
 
-async function downloadImage(url) { const res = await fetch(url); const buffer = await res.buffer(); const file = ./uploads/frame_${Date.now()}.png; fs.writeFileSync(file, buffer); return file; }
+  const host = process.env.PYTHON_API_HOST?.trim();
+  if (host) {
+    const scheme = host.startsWith("http://") || host.startsWith("https://") ? "" : "http://";
+    const hasPort = /^https?:\/\/[^/]+:\d+$/.test(`${scheme}${host}`);
+    const port = hasPort ? "" : `:${process.env.PYTHON_API_PORT || "8000"}`;
+    return `${scheme}${host}${port}`.replace(/\/$/, "");
+  }
 
-export async function generateScene(scene, characterKey) { const characters = await loadCharacters(); const char = characters[characterKey] || {};
+  return "http://127.0.0.1:8000";
+}
 
-let imagePath = ""; if (scene.imageUrl) { imagePath = await downloadImage(scene.imageUrl); } else if (char.image) { imagePath = "." + char.image; }
+async function ensureCharactersFile() {
+  try {
+    await fs.promises.access(charactersFile);
+  } catch {
+    await fs.promises.copyFile(defaultCharactersFile, charactersFile);
+  }
+}
 
-const params = new URLSearchParams({ prompt: scene.prompt, frames: framesFromScene(scene), fps: scene.fps || 15, guidance: scene.guidance || 7.5, seed: (char.seed || scene.seed || "").toString(), preset: scene.preset || "", character_tag: char.tag || "", style_tag: scene.style || "", image_path: imagePath, breathing: scene.breathing ? "true" : "false", expression_profile: scene.expression_profile || "neutral" });
+export async function loadCharacters() {
+  await ensureCharactersFile();
+  return JSON.parse(await fs.promises.readFile(charactersFile, "utf8"));
+}
 
-const res = await fetch(${PYTHON_API}/scene? + params.toString(), { method: "POST" }); const buffer = await res.buffer(); const file = ./generated/${scene.id}_${Date.now()}.mp4; fs.writeFileSync(file, buffer); return file; }
+export async function saveCharacters(characters) {
+  await ensureCharactersFile();
+  const temporaryFile = `${charactersFile}.${crypto.randomUUID()}.tmp`;
+  await fs.promises.writeFile(temporaryFile, `${JSON.stringify(characters, null, 2)}\n`);
+  await fs.promises.rename(temporaryFile, charactersFile);
+}
 
-async function cutAudio(input, start, duration, out) { await new Promise((resolve, reject) => { const ff = spawn("ffmpeg", [ "-y", "-i", input, "-ss", start.toString(), "-t", duration.toString(), "-acodec", "copy", out ]); ff.on("close", code => (code === 0 ? resolve() : reject(code))); }); }
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", chunk => {
+      stderr += chunk.toString();
+      if (stderr.length > 16_000) stderr = stderr.slice(-16_000);
+    });
+    child.once("error", reject);
+    child.once("close", code => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} exited with code ${code}: ${stderr.trim()}`));
+    });
+  });
+}
 
-async function getAlignment(audioPath, transcript) { const res = await fetch(${PYTHON_API}/align, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audio_path: audioPath, transcript }) }); return await res.json(); }
+async function probeDuration(file) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      file
+    ]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", chunk => (stdout += chunk.toString()));
+    child.stderr.on("data", chunk => (stderr += chunk.toString()));
+    child.once("error", reject);
+    child.once("close", code => {
+      const duration = Number.parseFloat(stdout);
+      if (code === 0 && Number.isFinite(duration) && duration > 0) resolve(duration);
+      else reject(new Error(`Could not read audio duration: ${stderr.trim()}`));
+    });
+  });
+}
 
-function mapScenesToAudio(scenes, alignment) { const sceneAudioMap = {}; let currentTime = 0;
+function sceneDurations(scenes, totalAudioDuration) {
+  if (!totalAudioDuration) return scenes.map(scene => scene.duration);
 
-for (const scene of scenes) { const words = scene.prompt.split(/\s+/); const duration = words.reduce((acc, w) => { const match = alignment.words?.find(a => a.word === w.toLowerCase()); return acc + (match ? match.end - match.start : 0.4); }, 0); sceneAudioMap[scene.id] = { start: currentTime, duration }; currentTime += duration; }
+  const weights = scenes.map(scene => Math.max(1, scene.prompt.split(/\s+/).length));
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  return weights.map(weight => totalAudioDuration * weight / totalWeight);
+}
 
-return sceneAudioMap; }
+function characterImagePath(character) {
+  if (!character.image?.startsWith("/uploads/")) return null;
+  const candidate = path.resolve(dataDir, character.image.slice(1));
+  return candidate.startsWith(`${uploadsDir}${path.sep}`) && fs.existsSync(candidate) ? candidate : null;
+}
 
-async function lipsyncScene(videoPath, audioPath) { const res = await fetch(${PYTHON_API}/lipsync, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ video_path: videoPath, audio_path: audioPath }) }); const buffer = await res.buffer(); const file = ./generated/lipsynced_${Date.now()}.mp4; fs.writeFileSync(file, buffer); return file; }
+async function postForFile(url, options, destination) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Renderer returned ${response.status}: ${body.slice(0, 1000)}`);
+  }
+  await fs.promises.writeFile(destination, Buffer.from(await response.arrayBuffer()));
+  return destination;
+}
 
-export async function generateTimelineWithLipsync(scenes, characterKey, audioPath, transcript) { const alignment = await getAlignment(audioPath, transcript); const sceneMap = mapScenesToAudio(scenes, alignment);
+async function generateScene(scene, character, duration) {
+  const fps = Math.max(1, Math.min(scene.fps, Math.floor(300 / duration) || 1));
+  const frames = Math.max(1, Math.min(300, Math.round(duration * fps)));
+  const query = new URLSearchParams({
+    prompt: scene.prompt,
+    frames: String(frames),
+    fps: String(fps),
+    guidance: String(scene.guidance || 7.5),
+    seed: String(character.seed || scene.seed || 0),
+    preset: scene.preset || "cinematic",
+    character_tag: character.tag || "",
+    style_tag: scene.style || "",
+    breathing: String(Boolean(scene.breathing)),
+    expression_profile: scene.expression_profile || "neutral"
+  });
 
-const files = []; for (const scene of scenes) { const rawVideo = await generateScene(scene, characterKey); const { start, duration } = sceneMap[scene.id]; const sceneAudio = ./uploads/${scene.id}_audio.wav; await cutAudio(audioPath, start, duration, sceneAudio); const synced = await lipsyncScene(rawVideo, sceneAudio); files.push(synced); }
+  const form = new FormData();
+  const imagePath = characterImagePath(character);
+  if (imagePath) {
+    const image = await fs.promises.readFile(imagePath);
+    form.append("image", new Blob([image]), path.basename(imagePath));
+  }
 
-const listFile = "./generated/list.txt"; fs.writeFileSync(listFile, files.map(f => file '${f}').join("\n")); const output = ./generated/final_lipsynced_${Date.now()}.mp4;
+  const destination = path.join(generatedDir, `${scene.id}_${crypto.randomUUID()}.mp4`);
+  return postForFile(`${pythonApiUrl()}/scene?${query}`, { method: "POST", body: form }, destination);
+}
 
-await new Promise((resolve, reject) => { const ff = spawn("ffmpeg", [ "-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", output ]); ff.on("close", code => (code === 0 ? resolve() : reject(code))); });
+async function cutAudio(input, start, duration, output) {
+  await run("ffmpeg", [
+    "-y",
+    "-ss", start.toFixed(3),
+    "-t", duration.toFixed(3),
+    "-i", input,
+    "-vn",
+    "-ac", "1",
+    "-ar", "16000",
+    "-c:a", "pcm_s16le",
+    output
+  ]);
+}
 
-return output; }
+async function addAudio(videoPath, audioPath) {
+  const form = new FormData();
+  form.append("video", new Blob([await fs.promises.readFile(videoPath)]), path.basename(videoPath));
+  form.append("audio", new Blob([await fs.promises.readFile(audioPath)]), path.basename(audioPath));
+
+  const destination = path.join(generatedDir, `synced_${crypto.randomUUID()}.mp4`);
+  return postForFile(`${pythonApiUrl()}/lipsync`, { method: "POST", body: form }, destination);
+}
+
+function escapeConcatPath(file) {
+  return file.replaceAll("'", "'\\''");
+}
+
+async function pruneGeneratedVideos(maximumFiles = 25) {
+  const entries = await fs.promises.readdir(generatedDir, { withFileTypes: true });
+  const videos = await Promise.all(
+    entries
+      .filter(entry => entry.isFile() && /^video_[a-f0-9-]+\.mp4$/.test(entry.name))
+      .map(async entry => {
+        const file = path.join(generatedDir, entry.name);
+        const stats = await fs.promises.stat(file);
+        return { file, modified: stats.mtimeMs };
+      })
+  );
+
+  videos.sort((first, second) => second.modified - first.modified);
+  await Promise.all(
+    videos.slice(maximumFiles).map(video => fs.promises.rm(video.file, { force: true }))
+  );
+}
+
+async function concatenate(files) {
+  const id = crypto.randomUUID();
+  const listFile = path.join(generatedDir, `list_${id}.txt`);
+  const output = path.join(generatedDir, `video_${id}.mp4`);
+  await fs.promises.writeFile(listFile, files.map(file => `file '${escapeConcatPath(file)}'`).join("\n"));
+
+  try {
+    await run("ffmpeg", [
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", listFile,
+      "-c", "copy",
+      "-movflags", "+faststart",
+      output
+    ]);
+  } finally {
+    await fs.promises.rm(listFile, { force: true });
+  }
+
+  return output;
+}
+
+export async function generateTimeline(scenes, characterKey, audioPath = null) {
+  if (!scenes.length) throw new Error("The story did not contain any scenes.");
+
+  const characters = await loadCharacters();
+  const character = characters[characterKey];
+  if (!character) throw new Error("Unknown character.");
+
+  let audioDuration = null;
+  if (audioPath) {
+    try {
+      audioDuration = await probeDuration(audioPath);
+    } catch (cause) {
+      const error = new Error("The narration file could not be read.", { cause });
+      error.status = 400;
+      throw error;
+    }
+  }
+  if (audioDuration && audioDuration > 300) {
+    const error = new Error("Keep narration under five minutes.");
+    error.status = 400;
+    throw error;
+  }
+  const durations = sceneDurations(scenes, audioDuration);
+  const timelineFiles = [];
+  const temporaryFiles = [];
+  let audioOffset = 0;
+
+  try {
+    for (let index = 0; index < scenes.length; index += 1) {
+      const scene = { ...scenes[index], duration: durations[index] };
+      const rawVideo = await generateScene(scene, character, durations[index]);
+      temporaryFiles.push(rawVideo);
+
+      if (audioPath) {
+        const sceneAudio = path.join(uploadsDir, `${scene.id}_${crypto.randomUUID()}.wav`);
+        await cutAudio(audioPath, audioOffset, durations[index], sceneAudio);
+        temporaryFiles.push(sceneAudio);
+
+        const synced = await addAudio(rawVideo, sceneAudio);
+        temporaryFiles.push(synced);
+        timelineFiles.push(synced);
+        audioOffset += durations[index];
+      } else {
+        timelineFiles.push(rawVideo);
+      }
+    }
+
+    const output = await concatenate(timelineFiles);
+    await pruneGeneratedVideos();
+    return `/generated/${path.basename(output)}`;
+  } finally {
+    await Promise.all(temporaryFiles.map(file => fs.promises.rm(file, { force: true }).catch(() => {})));
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "video-gen-railway",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "railway:plan": "railway config plan",
+    "railway:apply": "railway config apply",
+    "test": "npm --prefix node-service run check && npm --prefix web run build && python3 -m compileall -q python-service"
+  },
+  "devDependencies": {
+    "railway": "3.12.0"
+  }
+}

@@ -1,11 +1,4 @@
-fastapi
-uvicorn
-torch
-diffusers
-transformers
-accelerate
-safetensors
-moviepy
-montreal-forced-aligner
-opencv-python
-numpy
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+Pillow==12.3.0
