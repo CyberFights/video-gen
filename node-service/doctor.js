@@ -68,6 +68,15 @@ async function main() {
     healthy = false;
     console.log(fail(`${config.hostname} is this service's own private domain. Point PYTHON_API_HOST at the renderer service instead: \${{renderer.RAILWAY_PRIVATE_DOMAIN}}.`));
   }
+  if (config.expectedPrivateHostname) {
+    healthy = false;
+    console.log(fail(
+      `PYTHON_API_HOST is ${config.hostname}, but Railway private hostnames are exactly ` +
+      "`<service-name>.railway.internal` — the project name is not part of the hostname — " +
+      `so that name can never resolve. A service named ` +
+      `"${config.expectedPrivateHostname.split(".")[0]}" lives at ${config.expectedPrivateHostname} instead.`
+    ));
+  }
   if (config.privateNetwork && !config.selfReference) {
     console.log(check(`Target uses Railway private networking (${config.hostname}).`));
   }
@@ -77,6 +86,49 @@ async function main() {
   if (addresses.error) {
     healthy = false;
     console.log(fail(`Lookup failed: ${addresses.error}. The renderer must be deployed in the same project and environment.`));
+    if (config.expectedPrivateHostname) {
+      const candidate = await resolveHost(config.expectedPrivateHostname);
+      if (candidate.error) {
+        console.log(fail(
+          `${config.expectedPrivateHostname} did not resolve either. If the renderer service is really ` +
+          `named "${config.expectedPrivateHostname.split(".")[0]}", it is not deployed (or not running) in ` +
+          "this environment — check its deploy logs. Otherwise the hostname is simply wrong."
+        ));
+      } else {
+        console.log(check(`The corrected form ${config.expectedPrivateHostname} DOES resolve:`));
+        for (const entry of candidate) {
+          console.log(check(`  IPv${entry.family} ${entry.address}`));
+        }
+        let confirmed = false;
+        for (const entry of candidate) {
+          const result = await tcpProbe(entry.address, config.port, entry.family);
+          if (result.ok) {
+            confirmed = true;
+            console.log(check(`${entry.address}:${config.port} accepted a connection — the renderer answers there.`));
+          } else {
+            console.log(fail(`${entry.address}:${config.port}: ${result.code}`));
+          }
+        }
+        try {
+          const response = await fetch(`http://${config.expectedPrivateHostname}:${config.port}/health`, { signal: AbortSignal.timeout(TCP_TIMEOUT_MS) });
+          const body = await response.text();
+          if (response.ok) {
+            confirmed = true;
+            console.log(check(`GET /health via ${config.expectedPrivateHostname} → ${response.status} ${body.slice(0, 120)}`));
+          } else {
+            console.log(fail(`GET /health via ${config.expectedPrivateHostname} → ${response.status} ${body.slice(0, 120)}`));
+          }
+        } catch (error) {
+          console.log(fail(`GET /health via ${config.expectedPrivateHostname} failed: ${error.cause?.code || error.code || error.message}`));
+        }
+        if (confirmed) {
+          console.log(check(
+            `The renderer's private domain is ${config.expectedPrivateHostname}. Fix: ` +
+            `PYTHON_API_HOST=\${{renderer.RAILWAY_PRIVATE_DOMAIN}} (or ${config.expectedPrivateHostname}), then redeploy.`
+          ));
+        }
+      }
+    }
   } else {
     for (const entry of addresses) {
       console.log(check(`IPv${entry.family} ${entry.address}`));

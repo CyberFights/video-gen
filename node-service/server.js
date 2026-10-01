@@ -56,7 +56,12 @@ app.get("/health", (_request, response) => {
   response.json({
     status: "ok",
     service: "video-gen",
-    renderer: { url: renderer.url, source: renderer.source, configured: renderer.configured }
+    renderer: {
+      url: renderer.url,
+      source: renderer.source,
+      configured: renderer.configured,
+      expectedPrivateHostname: renderer.expectedPrivateHostname
+    }
   });
 });
 
@@ -224,6 +229,15 @@ app.listen(port, "0.0.0.0", async () => {
       `PYTHON_API_* points at ${renderer.hostname}, which is this service's own private domain, ` +
       "so renders will fail with ECONNREFUSED. Point it at the renderer service: " +
       "PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000."
+    );
+  }
+
+  if (renderer.expectedPrivateHostname) {
+    console.warn(
+      `PYTHON_API_HOST is ${renderer.hostname}, but Railway private hostnames are exactly ` +
+      "`<service-name>.railway.internal` — the project name is not part of the hostname — so this " +
+      `address cannot resolve. The renderer's private domain is ${renderer.expectedPrivateHostname}. ` +
+      "Set PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000, and redeploy."
     );
   }
 
