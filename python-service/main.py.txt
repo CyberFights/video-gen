@@ -1,0 +1,71 @@
+import uuid from pathlib import Path import subprocess import torch import numpy as np from fastapi import FastAPI, Body from fastapi.responses import FileResponse, JSONResponse from diffusers import HunyuanVideoPipeline, StableVideoDiffusionPipeline from diffusers.utils import export_to_video, load_image from moviepy.editor import VideoFileClip, AudioFileClip import cv2app = FastAPI()device = "cuda" if torch.cuda.is_available() else "cpu"text_pipe = HunyuanVideoPipeline.from_pretrained( "tencent/HunyuanVideo", torch_dtype=torch.float16 if device == "cuda" else torch.float32 ).to(device)img_pipe = StableVideoDiffusionPipeline.from_pretrained( "stabilityai/stable-video-diffusion-img2vid-xt", torch_dtype=torch.float16 if device == "cuda" else torch.float32 ).to(device)OUTPUT = Path("videos") OUTPUT.mkdir(exist_ok=True)PRESETS = { "cinematic": "cinematic lighting, shallow depth of field, film grain, 4K", "documentary": "natural lighting, handheld camera, realistic colors", "anime": "anime style, cel shading, vibrant colors", "hyper_realistic": "photorealistic, ultra detailed, 8K" }STYLE_LORAS = {}def apply_lora(style_tag: str | None): if style_tag and style_tag in STYLE_LORAS: text_pipe.load_lora_weights(STYLE_LORAS[style_tag])def apply_breathing(video_path, out_path, intensity=0.01, period=3.0): clip = VideoFileClip(video_path)def breathe(get_frame, t):
+    frame = get_frame(t)
+    h, w, _ = frame.shape
+    offset = intensity * np.sin(2 * np.pi * t / period)
+    M = np.float32([[1, 0, 0], [0, 1 + offset, 0]])
+    return cv2.warpAffine(frame, M, (w, h))
+
+breathed = clip.fl(breathe)
+breathed.write_videofile(out_path, codec="libx264", audio_codec="aac")def apply_micro_expressions(video_path, out_path, profile="neutral"): clip = VideoFileClip(video_path)def enhance(get_frame, t):
+    frame = get_frame(t)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    face = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    if profile == "happy":
+        face = cv2.addWeighted(face, 1.0, np.full_like(face, 20), 0.2, 0)
+    elif profile == "angry":
+        face = cv2.addWeighted(face, 1.0, np.full_like(face, -20), 0.2, 0)
+
+    return face
+
+enhanced = clip.fl(enhance)
+enhanced.write_videofile(out_path, codec="libx264", audio_codec="aac")@app.post("/scene") async def generate_scene( prompt: str, frames: int = 32, fps: int = 15, guidance: float = 7.5, seed: int | None = None, preset: str | None = None, character_tag: str | None = None, style_tag: str | None = None, image_path: str | None = None, breathing: bool = False, expression_profile: str = "neutral" ): parts = [prompt] if character_tag: parts.append(character_tag) if style_tag: parts.append(style_tag) if preset and preset in PRESETS: parts.append(PRESETS[preset])final_prompt = ", ".join(parts)
+
+generator = torch.Generator(device=device)
+if seed is not None:
+    generator.manual_seed(seed)
+
+if image_path:
+    init_image = load_image(image_path)
+    result = img_pipe(
+        prompt=final_prompt,
+        image=init_image,
+        num_frames=frames,
+        generator=generator
+    ).frames
+else:
+    apply_lora(style_tag)
+    result = text_pipe(
+        prompt=final_prompt,
+        num_frames=frames,
+        guidance_scale=guidance,
+        generator=generator
+    ).frames
+
+vid_id = f"{uuid.uuid4()}.mp4"
+raw_path = OUTPUT / f"raw_{vid_id}"
+final_path = OUTPUT / vid_id
+
+export_to_video(result, raw_path.as_posix(), fps=fps)
+
+if breathing:
+    breathe_path = OUTPUT / f"breathing_{vid_id}"
+    apply_breathing(raw_path.as_posix(), breathe_path.as_posix())
+    raw_path = breathe_path
+
+if expression_profile != "neutral":
+    expr_path = OUTPUT / f"expr_{vid_id}"
+    apply_micro_expressions(raw_path.as_posix(), expr_path.as_posix(), expression_profile)
+    raw_path = expr_path
+
+raw_path.rename(final_path)
+return FileResponse(final_path, media_type="video/mp4")WAV2LIP_DIR = Path("Wav2Lip") CKPT = WAV2LIP_DIR / "checkpoints/wav2lip_gan.pth"@app.post("/lipsync") async def lipsync(video_path: str = Body(...), audio_path: str = Body(...)): out_path = OUTPUT / f"lipsynced_{uuid.uuid4()}.mp4" cmd = [ "python", str(WAV2LIP_DIR / "inference.py"), "--checkpoint_path", str(CKPT), "--face", video_path, "--audio", audio_path, "--outfile", str(out_path) ] subprocess.check_call(cmd) return FileResponse(out_path, media_type="video/mp4")ALIGN_DIR = Path("alignment") ALIGN_DIR.mkdir(exist_ok=True)@app.post("/align") async def align(audio_path: str = Body(...), transcript: str = Body(...)): text_file = ALIGN_DIR / f"{uuid.uuid4()}.txt" text_file.write_text(transcript) output_json = ALIGN_DIR / f"{uuid.uuid4()}.json"cmd = [
+    "mfa", "align",
+    str(audio_path),
+    str(text_file),
+    "english",
+    str(output_json),
+    "--output_format", "json"
+]
+subprocess.check_call(cmd)
+return JSONResponse(output_json.read_text())
