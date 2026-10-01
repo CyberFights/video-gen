@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import multer from "multer";
 import { storyToScenes } from "./story_to_scenes.js";
-import { generateTimeline, loadCharacters, saveCharacters } from "./video.js";
+import { checkRenderer, generateTimeline, loadCharacters, rendererConfig, saveCharacters } from "./video.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
@@ -52,7 +52,22 @@ app.use("/generated", express.static(generatedDir, { fallthrough: false }));
 app.use("/uploads", express.static(uploadsDir, { fallthrough: false }));
 
 app.get("/health", (_request, response) => {
-  response.json({ status: "ok", service: "video-gen" });
+  const renderer = rendererConfig();
+  response.json({
+    status: "ok",
+    service: "video-gen",
+    renderer: { url: renderer.url, source: renderer.source, configured: renderer.configured }
+  });
+});
+
+// Deep check: verifies the renderer is actually reachable from this service.
+app.get("/health/renderer", async (_request, response, next) => {
+  try {
+    const renderer = await checkRenderer();
+    response.status(renderer.reachable ? 200 : 503).json(renderer);
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/characters", async (_request, response, next) => {
@@ -142,6 +157,12 @@ app.post("/api/story", upload.single("audio"), async (request, response, next) =
       return response.status(400).json({ error: "Select a valid character." });
     }
 
+    const renderer = await checkRenderer();
+    if (!renderer.reachable) {
+      if (request.file) await fs.promises.rm(request.file.path, { force: true });
+      return response.status(503).json({ error: renderer.error });
+    }
+
     const spec = storyToScenes(story, character);
     const file = await generateTimeline(
       spec.scenes,
@@ -184,6 +205,21 @@ app.use((error, _request, response, _next) => {
 });
 
 const port = Number.parseInt(process.env.PORT || "3000", 10);
-app.listen(port, "0.0.0.0", () => {
+app.listen(port, "0.0.0.0", async () => {
   console.log(`Video Gen is listening on 0.0.0.0:${port}`);
+
+  const renderer = rendererConfig();
+  if (!renderer.configured) {
+    console.warn(
+      `No renderer configured. Falling back to ${renderer.url}. ` +
+      "Set PYTHON_API_URL, or PYTHON_API_HOST and PYTHON_API_PORT, to reach the renderer service " +
+      "(on Railway: PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000)."
+    );
+  } else {
+    console.log(`Renderer configured at ${renderer.url} (from PYTHON_API_${renderer.source.toUpperCase()}).`);
+  }
+
+  const status = await checkRenderer();
+  if (status.reachable) console.log(`Renderer health check passed at ${status.url}.`);
+  else console.warn(`Renderer health check failed: ${status.error}`);
 });

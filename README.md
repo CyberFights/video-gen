@@ -94,6 +94,9 @@ Then open <http://localhost:3000>.
 | `PYTHON_API_URL` | — | Complete renderer URL; takes precedence over host/port |
 | `PYTHON_API_HOST` | — | Renderer private hostname |
 | `PYTHON_API_PORT` | `8000` | Renderer private port |
+| `PYTHON_API_TIMEOUT_MS` | `600000` | Per-render request timeout |
+| `PYTHON_API_HEALTH_TIMEOUT_MS` | `5000` | Renderer health-check timeout |
+| `PYTHON_API_RETRIES` | `3` | Connection attempts per renderer request |
 
 ### Renderer
 
@@ -104,6 +107,31 @@ Then open <http://localhost:3000>.
 | `VIDEO_WIDTH` / `VIDEO_HEIGHT` | `768` / `432` | CPU output dimensions |
 | `WAV2LIP_DIR` | `/opt/Wav2Lip` | Optional Wav2Lip checkout |
 | `WAV2LIP_CHECKPOINT` | `$WAV2LIP_DIR/checkpoints/wav2lip_gan.pth` | Optional checkpoint |
+
+## Troubleshooting
+
+### `ECONNREFUSED 127.0.0.1:8000` during generation
+
+`127.0.0.1:8000` is the local-development fallback. Seeing it in a deployment means the app
+service has no renderer address: neither `PYTHON_API_URL` nor `PYTHON_API_HOST` was set (or the
+Railway variable reference resolved to an empty string), so the app looked for a renderer inside
+its own container.
+
+Check what the app resolved:
+
+```bash
+curl https://<app-domain>/health           # shows renderer.url and renderer.source
+curl https://<app-domain>/health/renderer  # 200 when reachable, 503 with the reason otherwise
+```
+
+If `renderer.source` is `fallback`, set on the **app** service either
+`PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}` with `PYTHON_API_PORT=8000`, or a complete
+`PYTHON_API_URL`, then redeploy. The variable reference only resolves once the renderer service
+exists, so apply the renderer first.
+
+If `renderer.source` is set but the renderer is still unreachable, confirm the renderer is
+deployed, healthy on `/health`, listening on `PORT=8000`, and in the same Railway project and
+environment (private networking does not cross environments).
 
 ## Checks
 
