@@ -133,6 +133,23 @@ If `renderer.source` is set but the renderer is still unreachable, confirm the r
 deployed, healthy on `/health`, listening on `PORT=8000`, and in the same Railway project and
 environment (private networking does not cross environments).
 
+### `ENOTFOUND` with `http://renderer:8000`
+
+`renderer` is the Docker Compose service name from `compose.yaml`; it only resolves inside the
+Compose network. Seeing `The renderer at http://renderer:8000 is unreachable (ENOTFOUND)` means
+that value was copied somewhere the name does not exist:
+
+- **On Railway:** remove `PYTHON_API_URL=http://renderer:8000` and instead set
+  `PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}` with `PYTHON_API_PORT=8000` (or
+  `PYTHON_API_URL=http://${{renderer.RAILWAY_PRIVATE_DOMAIN}}:8000`). Railway private DNS
+  resolves `<service>.railway.internal`, never the bare Compose-style service name.
+- **Running locally without Docker:** unset `PYTHON_API_URL` (the app then falls back to
+  `http://127.0.0.1:8000`) and start the renderer with
+  `uvicorn main:app --host 0.0.0.0 --port 8000` from `python-service/`.
+- **With Docker Compose:** the checked-in `compose.yaml` wires this up; `ENOTFOUND` there means
+  the renderer container is not running or the app was started outside the Compose network. Run
+  `docker compose up --build` and check `docker compose ps` / `docker compose logs renderer`.
+
 ## Checks
 
 ```bash
