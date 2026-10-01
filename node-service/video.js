@@ -30,14 +30,60 @@ const RETRYABLE_CONNECT_CODES = new Set([
   "UND_ERR_SOCKET"
 ]);
 
+/** Hostnames that mean "this very container", so a renderer there is a misconfiguration. */
+function ownHostnames() {
+  const names = new Set();
+  const privateDomain = process.env.RAILWAY_PRIVATE_DOMAIN?.trim();
+  const serviceName = process.env.RAILWAY_SERVICE_NAME?.trim();
+  if (privateDomain) names.add(privateDomain.toLowerCase());
+  if (serviceName) {
+    names.add(serviceName.toLowerCase());
+    names.add(`${serviceName.toLowerCase()}.railway.internal`);
+  }
+  return names;
+}
+
 /**
  * Resolves the renderer base URL from the environment.
  *
  * `source` is "url" or "host" when the renderer was configured explicitly and
  * "fallback" when nothing was configured. The fallback only makes sense for
  * local development, where the renderer runs beside the app on the same host.
+ *
+ * `selfReference` is true when the configured address is this service's own
+ * private domain: the app would dial itself, which is the usual cause of an
+ * ECONNREFUSED against a `*.railway.internal` host that resolves fine.
  */
 export function rendererConfig() {
+  const base = resolveRendererUrl();
+  let hostname = null;
+  let port = null;
+  try {
+    const parsed = new URL(base.url);
+    hostname = parsed.hostname.toLowerCase();
+    port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+  } catch {
+    // Leave hostname/port null; the fetch below will surface the bad URL.
+  }
+
+  const own = ownHostnames();
+  const appPort = (process.env.PORT || "3000").trim();
+  const selfReference = Boolean(
+    hostname && own.has(hostname) && base.source !== "fallback"
+  );
+
+  return {
+    ...base,
+    hostname,
+    port,
+    selfReference,
+    // Pointing at our own private domain *and* our own port is doubly wrong.
+    selfLoop: selfReference && port === appPort,
+    privateNetwork: Boolean(hostname?.endsWith(".railway.internal"))
+  };
+}
+
+function resolveRendererUrl() {
   const configuredUrl = process.env.PYTHON_API_URL?.trim();
   if (configuredUrl) {
     return { url: configuredUrl.replace(/\/+$/, ""), source: "url", configured: true };
@@ -65,12 +111,54 @@ function connectErrorCode(error) {
   return null;
 }
 
+/**
+ * Turns a connection failure into an explanation of the likely cause.
+ *
+ * ECONNREFUSED against a `*.railway.internal` name means DNS worked and the
+ * TCP connect was rejected, so the address is reachable but nothing is
+ * listening there. The two causes worth calling out are dialing the wrong
+ * service (often the app itself) and a renderer bound to IPv4 only in an
+ * IPv6-only private network.
+ */
+function rendererDiagnosis(code, config) {
+  const hints = [];
+
+  if (config.selfReference) {
+    hints.push(
+      `${config.hostname} is this app service's own private domain, not the renderer's, ` +
+      "so the app is dialing itself. Set PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}} " +
+      "(reference the renderer service, not this one) and redeploy."
+    );
+  }
+
+  if (code === "ECONNREFUSED" && config.privateNetwork && !config.selfReference) {
+    hints.push(
+      `DNS for ${config.hostname} resolved but port ${config.port} refused the connection: either no renderer ` +
+      "service answers on that name, or it is listening on IPv4 only while Railway private networking is IPv6. " +
+      "The renderer must bind :: (python-service/serve.py does this); check its deploy logs for " +
+      `"Renderer listening on [::]:${config.port}".`
+    );
+  }
+
+  if ((code === "ENOTFOUND" || code === "EAI_AGAIN") && config.privateNetwork) {
+    hints.push(
+      `${config.hostname} did not resolve. Private DNS only resolves for services in the same project and ` +
+      "environment, and only at runtime, so confirm the renderer is deployed there and the variable reference resolved."
+    );
+  }
+
+  return hints;
+}
+
 function rendererUnreachableError(url, cause) {
-  const { configured } = rendererConfig();
+  const config = rendererConfig();
+  const { configured } = config;
   const code = connectErrorCode(cause) || "unknown error";
-  const message = configured
+  const base = configured
     ? `The renderer at ${url} is unreachable (${code}). Confirm the renderer service is running and that PYTHON_API_URL or PYTHON_API_HOST/PYTHON_API_PORT point at it.`
     : `No renderer is configured, so the app tried ${url} and failed (${code}). Set PYTHON_API_URL, or set PYTHON_API_HOST and PYTHON_API_PORT, to the renderer service (on Railway: PYTHON_API_HOST=\${{renderer.RAILWAY_PRIVATE_DOMAIN}} and PYTHON_API_PORT=8000).`;
+  const hints = rendererDiagnosis(code, config);
+  const message = hints.length ? `${base} ${hints.join(" ")}` : base;
 
   const error = new Error(message, { cause });
   error.status = 503;

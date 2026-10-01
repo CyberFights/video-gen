@@ -36,7 +36,10 @@ If you prefer the dashboard instead of IaC:
 5. Mount a volume at `/data` on the app and generate a public domain for the app.
 6. Set both health-check paths to `/health`.
 
-Do not expose the renderer publicly. Both services listen on `0.0.0.0` and honor Railway's `PORT` variable.
+Do not expose the renderer publicly. Both services honor Railway's `PORT` variable. The renderer
+starts through `python-service/serve.py`, which binds a dual-stack socket (`[::]`, IPv6 + IPv4) so
+that Railway private networking and Railway's IPv4 health check both reach it; the app listens on
+`0.0.0.0`.
 
 ## Rendering modes
 
@@ -69,7 +72,7 @@ cd python-service
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
+python serve.py
 ```
 
 ```bash
@@ -98,12 +101,17 @@ Then open <http://localhost:3000>.
 | `PYTHON_API_HEALTH_TIMEOUT_MS` | `5000` | Renderer health-check timeout |
 | `PYTHON_API_RETRIES` | `3` | Connection attempts per renderer request |
 
+Run `npm --prefix node-service run doctor` inside the app service to verify these settings against
+the live renderer (DNS, TCP connect, and `/health`); it exits non-zero when the renderer is
+unreachable.
+
 ### Renderer
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `8000` | HTTP listen port |
 | `VIDEO_BACKEND` | `cpu` | `cpu` or optional `diffusers` |
+| `LOG_LEVEL` | `info` | uvicorn log level |
 | `VIDEO_WIDTH` / `VIDEO_HEIGHT` | `768` / `432` | CPU output dimensions |
 | `WAV2LIP_DIR` | `/opt/Wav2Lip` | Optional Wav2Lip checkout |
 | `WAV2LIP_CHECKPOINT` | `$WAV2LIP_DIR/checkpoints/wav2lip_gan.pth` | Optional checkpoint |
@@ -133,6 +141,50 @@ If `renderer.source` is set but the renderer is still unreachable, confirm the r
 deployed, healthy on `/health`, listening on `PORT=8000`, and in the same Railway project and
 environment (private networking does not cross environments).
 
+### `ECONNREFUSED` with a `*.railway.internal` host
+
+```text
+The renderer at http://<name>.railway.internal:8000 is unreachable (ECONNREFUSED).
+```
+
+`ECONNREFUSED` (unlike `ENOTFOUND`) means private DNS resolved and the TCP connection was
+actively refused: the address is right but nothing is listening on that port. Run the built-in
+diagnostic from the **app** service — it prints the resolved config, the DNS records, a TCP probe
+per address, and the `/health` response:
+
+```bash
+railway ssh --service app   # or: railway run --service app npm --prefix node-service run doctor
+npm --prefix node-service run doctor
+```
+
+Two causes account for nearly every case:
+
+1. **The host is the wrong service — usually the app itself.** The renderer service in this repo
+   is named `renderer`, so its private domain is `renderer.railway.internal`. A host like
+   `video-gen.railway.internal` is the *app's* own domain (Railway names the private domain after
+   the service, and the app service is often named after the repository), so the app dials itself
+   on port 8000, where only port 3000 is listening. Set `PYTHON_API_HOST` to a reference to the
+   renderer service, `${{renderer.RAILWAY_PRIVATE_DOMAIN}}`, not to a hard-coded name or to this
+   service, then redeploy. The app logs this at startup and `doctor` reports it as a failure.
+2. **The renderer is listening on IPv4 only.** Railway environments created before 2025-10-16
+   have an IPv6-only private network, so a renderer bound to `0.0.0.0` refuses private-network
+   connections even though it is running and its public health check passes. `uvicorn --host ::`
+   does not fix this either: uvicorn passes the host to asyncio, which sets `IPV6_V6ONLY`, and
+   then Railway's IPv4 health check fails instead. The renderer therefore starts via
+   `python serve.py`, which binds one dual-stack socket. Its log line should read:
+
+   ```text
+   Renderer listening on [::]:8000 (IPv6 + IPv4).
+   ```
+
+   If the renderer logs `Uvicorn running on http://0.0.0.0:8000`, it is running an old start
+   command — clear any custom start command on the service so the image `CMD` applies, and
+   redeploy.
+
+Also confirm the renderer is deployed in the same project **and** environment as the app
+(private networking does not cross environments) and that `PYTHON_API_PORT` matches the
+renderer's `PORT`.
+
 ### `ENOTFOUND` with `http://renderer:8000`
 
 `renderer` is the Docker Compose service name from `compose.yaml`; it only resolves inside the
@@ -145,7 +197,7 @@ that value was copied somewhere the name does not exist:
   resolves `<service>.railway.internal`, never the bare Compose-style service name.
 - **Running locally without Docker:** unset `PYTHON_API_URL` (the app then falls back to
   `http://127.0.0.1:8000`) and start the renderer with
-  `uvicorn main:app --host 0.0.0.0 --port 8000` from `python-service/`.
+  `python serve.py` from `python-service/`.
 - **With Docker Compose:** the checked-in `compose.yaml` wires this up; `ENOTFOUND` there means
   the renderer container is not running or the app was started outside the Compose network. Run
   `docker compose up --build` and check `docker compose ps` / `docker compose logs renderer`.
