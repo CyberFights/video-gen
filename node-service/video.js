@@ -15,19 +15,111 @@ for (const directory of [dataDir, uploadsDir, generatedDir]) {
   fs.mkdirSync(directory, { recursive: true });
 }
 
-function pythonApiUrl() {
+const RENDERER_REQUEST_TIMEOUT_MS = Number.parseInt(process.env.PYTHON_API_TIMEOUT_MS || "600000", 10);
+const RENDERER_HEALTH_TIMEOUT_MS = Number.parseInt(process.env.PYTHON_API_HEALTH_TIMEOUT_MS || "5000", 10);
+const RENDERER_CONNECT_ATTEMPTS = Math.max(1, Number.parseInt(process.env.PYTHON_API_RETRIES || "3", 10));
+const RETRYABLE_CONNECT_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET"
+]);
+
+/**
+ * Resolves the renderer base URL from the environment.
+ *
+ * `source` is "url" or "host" when the renderer was configured explicitly and
+ * "fallback" when nothing was configured. The fallback only makes sense for
+ * local development, where the renderer runs beside the app on the same host.
+ */
+export function rendererConfig() {
   const configuredUrl = process.env.PYTHON_API_URL?.trim();
-  if (configuredUrl) return configuredUrl.replace(/\/$/, "");
+  if (configuredUrl) {
+    return { url: configuredUrl.replace(/\/+$/, ""), source: "url", configured: true };
+  }
 
   const host = process.env.PYTHON_API_HOST?.trim();
   if (host) {
     const scheme = host.startsWith("http://") || host.startsWith("https://") ? "" : "http://";
     const hasPort = /^https?:\/\/[^/]+:\d+$/.test(`${scheme}${host}`);
-    const port = hasPort ? "" : `:${process.env.PYTHON_API_PORT || "8000"}`;
-    return `${scheme}${host}${port}`.replace(/\/$/, "");
+    const port = hasPort ? "" : `:${process.env.PYTHON_API_PORT?.trim() || "8000"}`;
+    return { url: `${scheme}${host}${port}`.replace(/\/+$/, ""), source: "host", configured: true };
   }
 
-  return "http://127.0.0.1:8000";
+  return { url: "http://127.0.0.1:8000", source: "fallback", configured: false };
+}
+
+function pythonApiUrl() {
+  return rendererConfig().url;
+}
+
+function connectErrorCode(error) {
+  for (let current = error; current; current = current.cause) {
+    if (typeof current.code === "string") return current.code;
+  }
+  return null;
+}
+
+function rendererUnreachableError(url, cause) {
+  const { configured } = rendererConfig();
+  const code = connectErrorCode(cause) || "unknown error";
+  const message = configured
+    ? `The renderer at ${url} is unreachable (${code}). Confirm the renderer service is running and that PYTHON_API_URL or PYTHON_API_HOST/PYTHON_API_PORT point at it.`
+    : `No renderer is configured, so the app tried ${url} and failed (${code}). Set PYTHON_API_URL, or set PYTHON_API_HOST and PYTHON_API_PORT, to the renderer service (on Railway: PYTHON_API_HOST=\${{renderer.RAILWAY_PRIVATE_DOMAIN}} and PYTHON_API_PORT=8000).`;
+
+  const error = new Error(message, { cause });
+  error.status = 503;
+  error.code = "RENDERER_UNREACHABLE";
+  return error;
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * fetch with a request timeout plus retries for connection-level failures.
+ * Railway private networking (and docker compose startup) can refuse
+ * connections for a few seconds after a deploy, so a transient ECONNREFUSED
+ * should not fail a whole render.
+ */
+async function rendererFetch(url, options, { timeoutMs = RENDERER_REQUEST_TIMEOUT_MS, attempts = RENDERER_CONNECT_ATTEMPTS } = {}) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      lastError = error;
+      const code = connectErrorCode(error);
+      const retryable = RETRYABLE_CONNECT_CODES.has(code);
+      if (!retryable || attempt === attempts) break;
+      console.warn(`Renderer request to ${url} failed with ${code}; retry ${attempt}/${attempts - 1}.`);
+      await sleep(attempt * 1000);
+    }
+  }
+
+  throw rendererUnreachableError(pythonApiUrl(), lastError);
+}
+
+/** Cheap preflight so misconfiguration surfaces before any ffmpeg work. */
+export async function checkRenderer() {
+  const { url, source, configured } = rendererConfig();
+  try {
+    const response = await rendererFetch(`${url}/health`, { method: "GET" }, {
+      timeoutMs: RENDERER_HEALTH_TIMEOUT_MS,
+      attempts: 1
+    });
+    if (!response.ok) {
+      return { url, source, configured, reachable: false, error: `Renderer health check returned ${response.status}.` };
+    }
+    return { url, source, configured, reachable: true };
+  } catch (error) {
+    return { url, source, configured, reachable: false, error: error.message };
+  }
 }
 
 async function ensureCharactersFile() {
@@ -102,7 +194,7 @@ function characterImagePath(character) {
 }
 
 async function postForFile(url, options, destination) {
-  const response = await fetch(url, options);
+  const response = await rendererFetch(url, options);
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Renderer returned ${response.status}: ${body.slice(0, 1000)}`);
