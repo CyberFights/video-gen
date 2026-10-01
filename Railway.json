@@ -1,1 +1,33 @@
-{ "services": [ { "name": "python-service", "rootDirectory": "python-service", "build": { "commands": ["pip install -r requirements.txt"] }, "start": { "command": "uvicorn main:app --host 0.0.0.0 --port $PORT" } }, { "name": "node-service", "rootDirectory": "node-service", "build": { "commands": ["npm install"] }, "start": { "command": "npm start" }, "envVars": { "PYTHON_API_URL": { "service": "python-service", "type": "url" } } }, { "name": "web", "rootDirectory": "web", "build": { "commands": ["npm install", "npm run build"] }, "static": { "publishDirectory": "dist" }, "envVars": { "VITE_NODE_API_URL": { "service": "node-service", "type": "url" } } } ] }
+version: 1
+
+services:
+  python-service:
+    root: python-service
+    build:
+      command: pip install -r requirements.txt
+    deploy:
+      command: uvicorn main:app --host 0.0.0.0 --port $PORT
+    env:
+      PORT: 8000
+
+  node-service:
+    root: node-service
+    build:
+      command: npm install
+    deploy:
+      command: npm start
+    env:
+      PYTHON_API_URL:
+        fromService: python-service
+        type: url
+
+  web:
+    root: web
+    build:
+      command: npm install && npm run build
+    static:
+      publish: dist
+    env:
+      VITE_NODE_API_URL:
+        fromService: node-service
+        type: url
