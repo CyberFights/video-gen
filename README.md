@@ -1,13 +1,13 @@
 # Video Gen
 
-A Railway-ready story-to-video application. The public Node service serves the React UI, stores character assets, creates scene timelines, and calls a private Python rendering service. The renderer uses FFmpeg and Pillow, so the default deployment works on Railway's CPU infrastructure.
+A Railway-ready story-to-video application. The public Node service serves the React UI, stores character assets, creates scene timelines, and uses MiniMax as the primary hosted video generator. A private Python renderer remains available as a deterministic local/CPU fallback. Keep provider credentials in deployment secrets; never commit an API key.
 
 ## Railway architecture
 
 | Service | Source root | Purpose | Public? |
 | --- | --- | --- | --- |
-| `app` | `/` | React UI, API, FFmpeg timeline assembly | Yes |
-| `renderer` | `/python-service` | CPU scene rendering and audio muxing | No |
+| `app` | `/` | React UI, API, MiniMax task orchestration, and timeline assembly | Yes |
+| `renderer` | `/python-service` | Optional CPU scene rendering and audio muxing fallback | No |
 | `app-data` | mounted at `/data` | Uploaded characters and generated videos | — |
 
 The old `railpack.yml` was removed because Railpack configuration describes one build, not a multi-service Railway project. The supported multi-service definition is [`.railway/railway.ts`](.railway/railway.ts).
@@ -25,7 +25,7 @@ railway config plan
 railway config apply
 ```
 
-The plan creates the `app` and `renderer` services and a 1 GB volume. Review the plan before applying it. In Railway, generate a public domain only for the **app** service. The app reaches the renderer over Railway private networking through the automatically configured `PYTHON_API_HOST` reference.
+The plan creates the `app` and optional fallback `renderer` services and a 1 GB volume. Review the plan before applying it. In Railway, generate a public domain only for the **app** service. The default app provider is MiniMax; set `MINIMAX_API_KEY` as a secret on the app service before generating. The app reaches the renderer over Railway private networking through the automatically configured `PYTHON_API_HOST` reference when `VIDEO_PROVIDER=renderer` is selected.
 
 If you prefer the dashboard instead of IaC:
 
@@ -43,7 +43,21 @@ that Railway private networking and Railway's IPv4 health check both reach it; t
 
 ## Rendering modes
 
-`VIDEO_BACKEND=cpu` is the Railway default. It creates animated, styled story cards (using an uploaded character image when available), then synchronizes optional narration with the timeline. This gives the application a functional, deterministic fallback without downloading model weights at startup.
+`VIDEO_PROVIDER=minimax` is the primary mode. It submits the story prompt to `POST https://api.minimax.io/v2/video_generation` using the MiniMax task API, polls the task until it completes, downloads the returned MP4, and serves it from `/generated`. The request defaults match the primary generator configuration:
+
+```json
+{
+  "model": "MiniMax-H3-Max",
+  "content": [{"type": "text", "text": "your story prompt"}],
+  "resolution": "768P",
+  "duration": 15,
+  "ratio": "16:9"
+}
+```
+
+The API key is read only from `MINIMAX_API_KEY`. Do not put a real key in source, `compose.yaml`, curl snippets, or frontend code. MiniMax generation is asynchronous, so the Node request remains open while it polls; configure the app's request timeout high enough for the provider. Optional uploaded narration is muxed onto the downloaded MP4 locally with FFmpeg.
+
+Set `VIDEO_PROVIDER=renderer` to use the existing private Python service instead. That fallback uses `VIDEO_BACKEND=cpu` by default and creates animated, styled story cards (using an uploaded character image when available), then synchronizes optional narration with the timeline. It is deterministic and does not download model weights at startup.
 
 The original HunyuanVideo pipeline requires a CUDA GPU and tens of gigabytes of model memory; Railway does not provide a GPU runtime. To run the original model on a separate CUDA host:
 
@@ -56,34 +70,29 @@ The `/lipsync` endpoint uses Wav2Lip only when both `WAV2LIP_DIR` and `WAV2LIP_C
 
 ## Run locally
 
-With Docker:
+Set the key in your shell (or copy `.env.example` to an untracked `.env` and load it), then run
+with Docker:
 
 ```bash
+export MINIMAX_API_KEY="<your-key>"
 docker compose up --build
 ```
 
-Open <http://localhost:3000>. The renderer health endpoint is available at <http://localhost:8000/health>.
+Open <http://localhost:3000>. The primary generator status is available at
+<http://localhost:3000/health/generator>.
 
-Without Docker, install FFmpeg and use two terminals:
-
-```bash
-# terminal 1
-cd python-service
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python serve.py
-```
+Without Docker, install FFmpeg and run the app:
 
 ```bash
-# terminal 2 (from the repository root)
+export MINIMAX_API_KEY="<your-key>"
 npm --prefix web install
 npm --prefix web run build
 npm --prefix node-service install
 PUBLIC_DIR="$PWD/web/dist" DATA_DIR="$PWD/.data" npm --prefix node-service start
 ```
 
-Then open <http://localhost:3000>.
+Then open <http://localhost:3000>. To use the CPU fallback instead, start `python-service/serve.py`
+and set `VIDEO_PROVIDER=renderer` plus the renderer URL before starting the Node app.
 
 ## Environment variables
 
@@ -94,16 +103,26 @@ Then open <http://localhost:3000>.
 | `PORT` | `3000` | HTTP listen port |
 | `DATA_DIR` | `node-service/data` | Character, upload, and generated-video storage |
 | `PUBLIC_DIR` | `node-service/public` | Built frontend directory |
-| `PYTHON_API_URL` | — | Complete renderer URL; takes precedence over host/port |
-| `PYTHON_API_HOST` | — | Renderer private hostname |
-| `PYTHON_API_PORT` | `8000` | Renderer private port |
-| `PYTHON_API_TIMEOUT_MS` | `600000` | Per-render request timeout |
-| `PYTHON_API_HEALTH_TIMEOUT_MS` | `5000` | Renderer health-check timeout |
-| `PYTHON_API_RETRIES` | `3` | Connection attempts per renderer request |
+| `VIDEO_PROVIDER` | `minimax` | `minimax` (primary) or `renderer` (private CPU fallback) |
+| `MINIMAX_API_KEY` | — | MiniMax bearer credential; store as a deployment secret |
+| `MINIMAX_API_BASE_URL` | `https://api.minimax.io` | MiniMax API base URL |
+| `MINIMAX_MODEL` | `MiniMax-H3-Max` | MiniMax video model |
+| `MINIMAX_RESOLUTION` | `768P` | MiniMax output resolution |
+| `MINIMAX_DURATION` | `15` | MiniMax output duration in seconds |
+| `MINIMAX_RATIO` | `16:9` | MiniMax output aspect ratio |
+| `MINIMAX_POLL_INTERVAL_MS` | `10000` | Delay between task status requests |
+| `MINIMAX_POLL_TIMEOUT_MS` | `900000` | Maximum time to wait for a task |
+| `MINIMAX_MAX_PROMPT_CHARS` | `2000` | Maximum prompt length sent to MiniMax |
+| `PYTHON_API_URL` | — | Complete fallback renderer URL; takes precedence over host/port |
+| `PYTHON_API_HOST` | — | Fallback renderer private hostname |
+| `PYTHON_API_PORT` | `8000` | Fallback renderer private port |
+| `PYTHON_API_TIMEOUT_MS` | `600000` | Per-render fallback request timeout |
+| `PYTHON_API_HEALTH_TIMEOUT_MS` | `5000` | Fallback renderer health-check timeout |
+| `PYTHON_API_RETRIES` | `3` | Connection attempts per fallback request |
 
-Run `npm --prefix node-service run doctor` inside the app service to verify these settings against
-the live renderer (DNS, TCP connect, and `/health`); it exits non-zero when the renderer is
-unreachable.
+Run `npm --prefix node-service run doctor` inside the app service when diagnosing the optional
+`VIDEO_PROVIDER=renderer` fallback (DNS, TCP connect, and `/health`). The primary MiniMax setup is
+checked by `GET /health/generator`, which reports configuration without exposing the API key.
 
 ### Renderer
 

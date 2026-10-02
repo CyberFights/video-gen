@@ -33,6 +33,9 @@ export default defineRailway(() => {
       DATA_DIR: "/data",
       NODE_ENV: "production",
       PORT: "3000",
+      // MiniMax is the primary video generator. Set MINIMAX_API_KEY as a
+      // secret in the app service; secrets are intentionally not committed.
+      VIDEO_PROVIDER: "minimax",
       // Resolves to <service-name>.railway.internal (e.g. renderer.railway.internal).
       // Railway private hostnames never include the project name, so never
       // hard-code names like renderer.video-gen.railway.internal — they do not

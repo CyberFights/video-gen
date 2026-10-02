@@ -5,7 +5,15 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import multer from "multer";
 import { storyToScenes } from "./story_to_scenes.js";
-import { checkRenderer, generateTimeline, loadCharacters, rendererConfig, saveCharacters } from "./video.js";
+import {
+  checkGenerator,
+  checkRenderer,
+  generateTimeline,
+  generatorConfig,
+  loadCharacters,
+  rendererConfig,
+  saveCharacters
+} from "./video.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
@@ -53,9 +61,18 @@ app.use("/uploads", express.static(uploadsDir, { fallthrough: false }));
 
 app.get("/health", (_request, response) => {
   const renderer = rendererConfig();
+  const generator = generatorConfig();
   response.json({
     status: "ok",
     service: "video-gen",
+    generator: {
+      provider: generator.provider,
+      configured: generator.configured,
+      model: generator.model,
+      resolution: generator.resolution,
+      duration: generator.duration,
+      ratio: generator.ratio
+    },
     renderer: {
       url: renderer.url,
       source: renderer.source,
@@ -70,6 +87,15 @@ app.get("/health/renderer", async (_request, response, next) => {
   try {
     const renderer = await checkRenderer();
     response.status(renderer.reachable ? 200 : 503).json(renderer);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/health/generator", async (_request, response, next) => {
+  try {
+    const generator = await checkGenerator();
+    response.status(generator.reachable ? 200 : 503).json(generator);
   } catch (error) {
     next(error);
   }
@@ -162,10 +188,10 @@ app.post("/api/story", upload.single("audio"), async (request, response, next) =
       return response.status(400).json({ error: "Select a valid character." });
     }
 
-    const renderer = await checkRenderer();
-    if (!renderer.reachable) {
+    const generator = await checkGenerator();
+    if (!generator.reachable) {
       if (request.file) await fs.promises.rm(request.file.path, { force: true });
-      return response.status(503).json({ error: renderer.error });
+      return response.status(generator.error?.includes("not configured") ? 503 : 502).json({ error: generator.error });
     }
 
     const spec = storyToScenes(story, character);
@@ -210,38 +236,61 @@ app.use((error, _request, response, _next) => {
 });
 
 const port = Number.parseInt(process.env.PORT || "3000", 10);
-app.listen(port, "0.0.0.0", async () => {
+const server = app.listen(port, "0.0.0.0", async () => {
   console.log(`Video Gen is listening on 0.0.0.0:${port}`);
 
-  const renderer = rendererConfig();
-  if (!renderer.configured) {
-    console.warn(
-      `No renderer configured. Falling back to ${renderer.url}. ` +
-      "Set PYTHON_API_URL, or PYTHON_API_HOST and PYTHON_API_PORT, to reach the renderer service " +
-      "(on Railway: PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000)."
-    );
+  const generator = generatorConfig();
+  if (generator.provider === "minimax") {
+    if (generator.configured) {
+      console.log(
+        `MiniMax is the primary video generator (${generator.model}, ${generator.resolution}, ` +
+        `${generator.duration}s, ${generator.ratio}).`
+      );
+    } else {
+      console.warn(
+        "MiniMax is the primary video generator, but MINIMAX_API_KEY is not configured. " +
+        "Set it as a deployment secret before generating a video."
+      );
+    }
   } else {
-    console.log(`Renderer configured at ${renderer.url} (from PYTHON_API_${renderer.source.toUpperCase()}).`);
+    const renderer = rendererConfig();
+    if (!renderer.configured) {
+      console.warn(
+        `No renderer configured. Falling back to ${renderer.url}. ` +
+        "Set PYTHON_API_URL, or PYTHON_API_HOST and PYTHON_API_PORT, to reach the renderer service " +
+        "(on Railway: PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000)."
+      );
+    } else {
+      console.log(`Renderer configured at ${renderer.url} (from PYTHON_API_${renderer.source.toUpperCase()}).`);
+    }
+
+    if (renderer.selfReference) {
+      console.warn(
+        `PYTHON_API_* points at ${renderer.hostname}, which is this service's own private domain, ` +
+        "so renders will fail with ECONNREFUSED. Point it at the renderer service: " +
+        "PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000."
+      );
+    }
+
+    if (renderer.expectedPrivateHostname) {
+      console.warn(
+        `PYTHON_API_HOST is ${renderer.hostname}, but Railway private hostnames are exactly ` +
+        "`<service-name>.railway.internal` — the project name is not part of the hostname — so this " +
+        `address cannot resolve. The renderer's private domain is ${renderer.expectedPrivateHostname}. ` +
+        "Set PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000, and redeploy."
+      );
+    }
   }
 
-  if (renderer.selfReference) {
-    console.warn(
-      `PYTHON_API_* points at ${renderer.hostname}, which is this service's own private domain, ` +
-      "so renders will fail with ECONNREFUSED. Point it at the renderer service: " +
-      "PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000."
-    );
+  const status = await checkGenerator();
+  if (status.reachable) {
+    console.log(`Primary generator is configured (${status.provider}).`);
+  } else {
+    console.warn(`Primary generator preflight failed: ${status.error}`);
   }
-
-  if (renderer.expectedPrivateHostname) {
-    console.warn(
-      `PYTHON_API_HOST is ${renderer.hostname}, but Railway private hostnames are exactly ` +
-      "`<service-name>.railway.internal` — the project name is not part of the hostname — so this " +
-      `address cannot resolve. The renderer's private domain is ${renderer.expectedPrivateHostname}. ` +
-      "Set PYTHON_API_HOST=${{renderer.RAILWAY_PRIVATE_DOMAIN}}, PYTHON_API_PORT=8000, and redeploy."
-    );
-  }
-
-  const status = await checkRenderer();
-  if (status.reachable) console.log(`Renderer health check passed at ${status.url}.`);
-  else console.warn(`Renderer health check failed: ${status.error}`);
 });
+
+// MiniMax is asynchronous; do not let Node's default five-minute request
+// timeout terminate a healthy generation task while it is being polled.
+server.requestTimeout = Number.parseInt(process.env.HTTP_REQUEST_TIMEOUT_MS || "1200000", 10);
+server.timeout = 0;
