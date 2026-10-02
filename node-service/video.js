@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { generateMinimaxVideo, minimaxConfig } from "./minimax.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
@@ -121,6 +122,32 @@ function resolveRendererUrl() {
 
 function pythonApiUrl() {
   return rendererConfig().url;
+}
+
+/**
+ * MiniMax is the primary generator. The existing private renderer remains
+ * available as an explicit local/renderer fallback for deployments that do
+ * not want to use the hosted provider.
+ */
+export function generatorConfig() {
+  const provider = (process.env.VIDEO_PROVIDER || "minimax").trim().toLowerCase();
+  if (provider === "minimax") {
+    const minimax = minimaxConfig();
+    return {
+      provider,
+      configured: minimax.configured,
+      model: minimax.model,
+      resolution: minimax.resolution,
+      duration: minimax.duration,
+      ratio: minimax.ratio
+    };
+  }
+
+  if (["renderer", "local", "cpu"].includes(provider)) {
+    return { provider: "renderer", ...rendererConfig() };
+  }
+
+  return { provider, configured: false, error: `Unknown VIDEO_PROVIDER: ${provider}.` };
 }
 
 function connectErrorCode(error) {
@@ -288,6 +315,31 @@ export async function checkRenderer() {
   }
 }
 
+/** Check the configured primary generator before accepting a render request. */
+export async function checkGenerator() {
+  const config = generatorConfig();
+  if (config.provider === "minimax") {
+    return config.configured
+      ? { provider: "minimax", configured: true, reachable: true, model: config.model }
+      : {
+          provider: "minimax",
+          configured: false,
+          reachable: false,
+          error: "MiniMax is the primary video generator, but MINIMAX_API_KEY is not configured."
+        };
+  }
+  if (config.provider === "renderer") {
+    const status = await checkRenderer();
+    return { provider: "renderer", ...status };
+  }
+  return {
+    provider: config.provider,
+    configured: false,
+    reachable: false,
+    error: config.error
+  };
+}
+
 async function ensureCharactersFile() {
   try {
     await fs.promises.access(charactersFile);
@@ -427,7 +479,7 @@ async function pruneGeneratedVideos(maximumFiles = 25) {
   const entries = await fs.promises.readdir(generatedDir, { withFileTypes: true });
   const videos = await Promise.all(
     entries
-      .filter(entry => entry.isFile() && /^video_[a-f0-9-]+\.mp4$/.test(entry.name))
+      .filter(entry => entry.isFile() && /^(?:video|synced)_[a-f0-9-]+\.mp4$/.test(entry.name))
       .map(async entry => {
         const file = path.join(generatedDir, entry.name);
         const stats = await fs.promises.stat(file);
@@ -464,12 +516,76 @@ async function concatenate(files) {
   return output;
 }
 
+function minimaxPrompt(scenes) {
+  if (scenes.length === 1) return scenes[0].prompt;
+
+  const sequence = scenes
+    .map((scene, index) => `Scene ${index + 1}: ${scene.prompt}`)
+    .join("\n");
+  return `Create one coherent cinematic video that follows this sequence from beginning to end:\n${sequence}`;
+}
+
+async function muxNarration(videoPath, audioPath) {
+  const destination = path.join(generatedDir, `synced_${crypto.randomUUID()}.mp4`);
+  await run("ffmpeg", [
+    "-y",
+    "-i", videoPath,
+    "-i", audioPath,
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+    "-c:v", "copy",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-shortest",
+    "-movflags", "+faststart",
+    destination
+  ]);
+  return destination;
+}
+
+async function generateMinimaxTimeline(scenes, audioPath = null) {
+  if (audioPath) {
+    const audioDuration = await probeDuration(audioPath);
+    if (audioDuration > 300) {
+      const error = new Error("Keep narration under five minutes.");
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  const generatedVideo = path.join(generatedDir, `video_${crypto.randomUUID()}.mp4`);
+  let finalVideo = generatedVideo;
+  try {
+    await generateMinimaxVideo(minimaxPrompt(scenes), generatedVideo);
+    if (audioPath) {
+      finalVideo = await muxNarration(generatedVideo, audioPath);
+      await fs.promises.rm(generatedVideo, { force: true });
+    }
+    await pruneGeneratedVideos();
+    return `/generated/${path.basename(finalVideo)}`;
+  } catch (error) {
+    await fs.promises.rm(generatedVideo, { force: true }).catch(() => {});
+    if (finalVideo !== generatedVideo) await fs.promises.rm(finalVideo, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 export async function generateTimeline(scenes, characterKey, audioPath = null) {
   if (!scenes.length) throw new Error("The story did not contain any scenes.");
 
   const characters = await loadCharacters();
   const character = characters[characterKey];
   if (!character) throw new Error("Unknown character.");
+
+  const selectedGenerator = generatorConfig();
+  if (selectedGenerator.provider === "minimax") {
+    return generateMinimaxTimeline(scenes, audioPath);
+  }
+  if (selectedGenerator.provider !== "renderer") {
+    const error = new Error(selectedGenerator.error);
+    error.status = 500;
+    throw error;
+  }
 
   let audioDuration = null;
   if (audioPath) {
